@@ -49,6 +49,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+    # Around line 40 in train.py, after "scene = Scene(...)"
+    print(f"DEBUG: Camera 0 resolution is {scene.getTrainCameras()[0].image_width}x{scene.getTrainCameras()[0].image_height}")
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
