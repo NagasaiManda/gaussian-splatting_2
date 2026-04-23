@@ -78,20 +78,20 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
 
         extr = cam_extrinsics[key]
         intr = cam_intrinsics[extr.camera_id]
-        height = intr.height
-        width = intr.width
+        height = intr.height * 4
+        width = intr.width * 4
 
         uid = intr.id
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
         if intr.model=="SIMPLE_PINHOLE":
-            focal_length_x = intr.params[0]
+            focal_length_x = intr.params[0] * 4
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
         elif intr.model=="PINHOLE":
-            focal_length_x = intr.params[0]
-            focal_length_y = intr.params[1]
+            focal_length_x = intr.params[0] * 4
+            focal_length_y = intr.params[1] * 4
             FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
         else:
@@ -190,7 +190,7 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
     else:
         test_cam_names_list = []
 
-    reading_dir = "images" if images == None else images
+    reading_dir = "images_4x" if images == None else images
     cam_infos_unsorted = readColmapCameras(
         cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, depths_params=depths_params,
         images_folder=os.path.join(path, reading_dir), 
