@@ -43,18 +43,24 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 
-def load_lr_gt(viewpoint_cam, dataset_path):        ###
-    # Assuming images_lr is parallel to the images folder
-    # and has the same filename (e.g., .jpg or .png)
-    img_name = viewpoint_cam.image_name
-    # You might need to check if it's .jpg or .png based on your dataset
-    lr_path = os.path.join(dataset_path, "images_lr", f"{img_name}.jpg") 
+from PIL import Image
+from torchvision import transforms
+
+def load_lr_gt(viewpoint_cam, dataset_path):                                    ####
+    # Split at the first dot and take only the prefix (e.g., 'image006')
+    base_name = viewpoint_cam.image_name.split('.')[0]
     
-    if not os.path.exists(lr_path):
-        lr_path = lr_path.replace(".jpg", ".png") # Fallback check
-        
-    lr_img = Image.open(lr_path)
-    return transforms.ToTensor()(lr_img).to("cuda")
+    lr_dir = os.path.join(dataset_path, "images_lr")
+    
+    # We check for both common extensions to find the actual file
+    for ext in [".jpg", ".png", ".JPG", ".PNG"]:
+        potential_path = os.path.join(lr_dir, f"{base_name}{ext}")
+        if os.path.exists(potential_path):
+            lr_img = Image.open(potential_path).convert("RGB")
+            return transforms.ToTensor()(lr_img).to("cuda")
+            
+    # If we get here, the file truly doesn't exist in that folder
+    raise FileNotFoundError(f"Could not find any LR image for '{base_name}' in {lr_dir}")
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
