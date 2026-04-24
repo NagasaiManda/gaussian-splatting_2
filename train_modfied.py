@@ -93,6 +93,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
+
+
+    # --- ADD THIS: Initialize S2Gaussian Tracking ---
+    flag_grads = {}
+    s2_eps = 0.1 # The epsilon decay factor from the paper
+    
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
@@ -211,6 +217,44 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_end.record()
 
         with torch.no_grad():
+            for group in gaussians.optimizer.param_groups:
+                name = group['name']
+                for p in group['params']:
+                    if p.grad is None:
+                        continue
+                    
+                    curr_grad = p.grad.data
+                    num_gaussians = curr_grad.shape[0]
+                    
+                    # Handle Densification/Pruning shape changes by resetting the flags
+                    # (In standard 3DGS, the number of Gaussians changes dynamically)
+                    if name not in flag_grads or flag_grads[name].shape != curr_grad.shape:
+                        flag_grads[name] = torch.zeros_like(curr_grad)
+                    
+                    flag = flag_grads[name]
+                    
+                    # Flatten the gradient per-Gaussian to compute alignment
+                    # (e.g., handles 3D positions, 1D opacities, and ND SH features)
+                    curr_grad_flat = curr_grad.view(num_gaussians, -1)
+                    flag_flat = flag.view(num_gaussians, -1)
+                    
+                    # Dot product > 0 is mathematically equivalent to Cosine Similarity > 0
+                    dot_product = (curr_grad_flat * flag_flat).sum(dim=-1)
+                    
+                    # Reshape the boolean mask so it broadcasts over the original parameter shape
+                    mask_positive = (dot_product > 0).view(num_gaussians, *([1] * (curr_grad.dim() - 1)))
+                    
+                    # Apply S2Gaussian conditional logic
+                    # If aligned: keep grad, update flag to average
+                    # If divergent: dampen grad by eps, update flag with momentum
+                    new_curr_grad = torch.where(mask_positive, curr_grad, s2_eps * curr_grad)
+                    new_flag = torch.where(mask_positive, (flag + curr_grad) / 2.0, (1.0 - s2_eps) * flag + s2_eps * curr_grad)
+                    
+                    # Overwrite the gradients for the optimizer to use
+                    p.grad.data = new_curr_grad
+                    
+                    # Save the updated flag gradient for the next iteration
+                    flag_grads[name] = new_flag
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
