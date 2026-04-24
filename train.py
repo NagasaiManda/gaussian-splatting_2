@@ -22,6 +22,8 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from PIL import Image                 #
+from torchvision import transforms    #
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -39,6 +41,21 @@ try:
     SPARSE_ADAM_AVAILABLE = True
 except:
     SPARSE_ADAM_AVAILABLE = False
+
+
+def load_lr_gt(viewpoint_cam, dataset_path):        ###
+    # Assuming images_lr is parallel to the images folder
+    # and has the same filename (e.g., .jpg or .png)
+    img_name = viewpoint_cam.image_name
+    # You might need to check if it's .jpg or .png based on your dataset
+    lr_path = os.path.join(dataset_path, "images_lr", f"{img_name}.jpg") 
+    
+    if not os.path.exists(lr_path):
+        lr_path = lr_path.replace(".jpg", ".png") # Fallback check
+        
+    lr_img = Image.open(lr_path)
+    return transforms.ToTensor()(lr_img).to("cuda")
+
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
@@ -118,15 +135,57 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             image *= alpha_mask
 
         # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
-        else:
-            ssim_value = ssim(image, gt_image)
+        # gt_image = viewpoint_cam.original_image.cuda()
+        # Ll1 = l1_loss(image, gt_image)
+        # if FUSED_SSIM_AVAILABLE:
+        #     ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+        # else:
+        #     ssim_value = ssim(image, gt_image)
 
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
+
+
+
+        ######################################################################################################
+        
+        gt_image_hr = viewpoint_cam.original_image.cuda()
+        
+        # 2. Get the actual LR ground truth (the original un-processed images)
+        gt_image_lr = load_lr_gt(viewpoint_cam, dataset.source_path)
+        
+        # 3. Render at HR (this is what the 'render' function already does)
+        image_hr = render_pkg["render"]
+        
+        # 4. Downsample the rendered HR image to match LR resolution
+        # We use area interpolation as it's standard for downsampling
+        lr_height, lr_width = gt_image_lr.shape[1], gt_image_lr.shape[2]
+        image_lr_rendered = torch.nn.functional.interpolate(
+            image_hr.unsqueeze(0), 
+            size=(lr_height, lr_width), 
+            mode='area'
+        ).squeeze(0)
+
+        # 5. Compute HR Loss (vs. Super-resolved images)
+        Ll1_hr = l1_loss(image_hr, gt_image_hr)
+        ssim_hr = fused_ssim(image_hr.unsqueeze(0), gt_image_hr.unsqueeze(0)) if FUSED_SSIM_AVAILABLE else ssim(image_hr, gt_image_hr)
+        loss_hr = (1.0 - opt.lambda_dssim) * Ll1_hr + opt.lambda_dssim * (1.0 - ssim_hr)
+
+        # 6. Compute LR Loss (The "Anchor" Loss vs. original LR images)
+        Ll1_lr = l1_loss(image_lr_rendered, gt_image_lr)
+        ssim_lr = fused_ssim(image_lr_rendered.unsqueeze(0), gt_image_lr.unsqueeze(0)) if FUSED_SSIM_AVAILABLE else ssim(image_lr_rendered, gt_image_lr)
+        loss_lr = (1.0 - opt.lambda_dssim) * Ll1_lr + opt.lambda_dssim * (1.0 - ssim_lr)
+
+        # 7. Total Weighted Loss
+        # Start with a high weight on LR to fix geometry, then let HR take over for detail
+        lambda_lr = 1.0  
+        lambda_hr = 0.5  # Adjust this: higher means more detail, but more risk of artifacts
+        loss = (lambda_hr * loss_hr) + (lambda_lr * loss_lr)
+
+
+
+
+        ######################################################################################################
         # Depth regularization
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
