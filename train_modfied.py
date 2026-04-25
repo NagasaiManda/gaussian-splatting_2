@@ -221,7 +221,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_end.record()
 
-        # with torch.no_grad():
+        with torch.no_grad():
         #     for group in gaussians.optimizer.param_groups:
         #         name = group['name']
         #         for p in group['params']:
