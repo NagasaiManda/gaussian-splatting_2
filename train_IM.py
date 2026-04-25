@@ -42,28 +42,28 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def prune_near_plane_floaters(gaussians, viewpoint_cam, min_distance=0.3):
-    """Deletes Gaussians that spawn right in front of the camera lens."""
-    xyz = gaussians.get_xyz
-    world_view_transform = viewpoint_cam.world_view_transform.cuda()
-    
-    # Transform to view space to get Z-depth
-    xyz_homo = torch.cat([xyz, torch.ones_like(xyz[:, :1])], dim=-1)
-    xyz_view = xyz_homo @ world_view_transform
-    z = xyz_view[:, 2] 
-    
-    # Identify floaters
-    is_too_close = (z > 0.0) & (z < min_distance)
-    
-    if is_too_close.any():
-        # IMPORTANT: Use a mask of points to KEEP, which is what 3DGS expects
-        # We want to keep points that are NOT too close
-        keep_mask = ~is_too_close 
-        
-        # We manually update the model parameters instead of calling a 
-        # potentially broken internal prune_points that expects tmp_radii
-        gaussians._densification_postfix(keep_mask)
 
+def get_perturbed_cam(viewpoint_cam, translation_std=0.002, rotation_std=0.001):
+    """
+    Slightly jiggles the camera extrinsics to prevent billboard overfitting.
+    """
+    import copy
+    # Create a shallow copy to avoid modifying the original dataset cameras
+    p_cam = copy.copy(viewpoint_cam)
+    
+    # Random translation shift
+    shift = torch.randn(3, device="cuda") * translation_std
+    
+    # Apply to the world-to-view matrix
+    # p_cam.world_view_transform is [4, 4]
+    p_cam.world_view_transform = viewpoint_cam.world_view_transform.clone()
+    p_cam.world_view_transform[3, :3] += shift
+    
+    # Recompute the full projection transform used by the rasterizer
+    p_cam.full_proj_transform = (p_cam.world_view_transform @ p_cam.projection_matrix)
+    p_cam.camera_center = p_cam.world_view_transform.inverse()[3, :3]
+    
+    return p_cam
 
 from PIL import Image
 from torchvision import transforms
@@ -160,7 +160,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        if iteration < opt.iterations:
+            render_cam = get_perturbed_cam(viewpoint_cam, translation_std=0.001) 
+        else:
+            render_cam = viewpoint_cam
+
+# Render with the jiggled camera
+        render_pkg = render(render_cam, gaussians, pipe, bg, 
+                    use_trained_exp=dataset.train_test_exp, 
+                    separate_sh=SPARSE_ADAM_AVAILABLE)
+        # render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -201,27 +210,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # 5. Compute HR Loss (vs. Super-resolved images)
         Ll1_hr = l1_loss(image_hr, gt_image_hr)
-        ssim_hr = fused_ssim(image_hr.unsqueeze(0), gt_image_hr.unsqueeze(0)) if FUSED_SSIM_AVAILABLE else ssim(image_hr, gt_image_hr)
-        loss_hr = (1.0 - opt.lambda_dssim) * Ll1_hr + opt.lambda_dssim * (1.0 - ssim_hr)
-
-        # 6. Compute LR Loss (The "Anchor" Loss vs. original LR images)
-        Ll1_lr = l1_loss(image_lr_rendered, gt_image_lr)
-        ssim_lr = fused_ssim(image_lr_rendered.unsqueeze(0), gt_image_lr.unsqueeze(0)) if FUSED_SSIM_AVAILABLE else ssim(image_lr_rendered, gt_image_lr)
-        loss_lr = (1.0 - opt.lambda_dssim) * Ll1_lr + opt.lambda_dssim * (1.0 - ssim_lr)
-
-        # 7. Total Weighted Loss
-        # Start with a high weight on LR to fix geometry, then let HR take over for detail
-        # lambda_lr = 1.0  
-        # lambda_hr = 0.5  # Adjust this: higher means more detail, but more risk of artifacts
-        # loss = (lambda_hr * loss_hr) + (lambda_lr * loss_lr)
-
-
-        progress = iteration / opt.iterations
-        curr_lambda_lr = 1.0 * (1.0 - progress) + 0.1 * progress  # From 1.0 down to 0.1
-        curr_lambda_hr = 0.2 * (1.0 - progress) + 1.0 * progress  # From 0.2 up to 1.0
+        # Use fused_ssim if available for speed, otherwise standard ssim
+        if FUSED_SSIM_AVAILABLE:
+            ssim_hr = fused_ssim(image_hr.unsqueeze(0), gt_image_hr.unsqueeze(0))
+        else:
+            ssim_hr = ssim(image_hr, gt_image_hr)
         
+        # Standard 3DGS formula: (1-lambda)*L1 + lambda*(1-SSIM)
+        loss_hr = (1.0 - opt.lambda_dssim) * Ll1_hr + opt.lambda_dssim * (1.0 - ssim_hr)
+        
+        # 6. Compute LR Loss (Anchor Loss)
+        Ll1_lr = l1_loss(image_lr_rendered, gt_image_lr)
+        if FUSED_SSIM_AVAILABLE:
+            ssim_lr = fused_ssim(image_lr_rendered.unsqueeze(0), gt_image_lr.unsqueeze(0))
+        else:
+            ssim_lr = ssim(image_lr_rendered, gt_image_lr)
+        
+        loss_lr = (1.0 - opt.lambda_dssim) * Ll1_lr + opt.lambda_dssim * (1.0 - ssim_lr)
+        
+        # 7. Total Weighted Loss (using your existing scheduling)
         loss = (curr_lambda_hr * loss_hr) + (curr_lambda_lr * loss_lr)
-
 
 
         ######################################################################################################
@@ -307,7 +315,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                    prune_near_plane_floaters(gaussians, viewpoint_cam, min_distance=0.3)
+                
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
