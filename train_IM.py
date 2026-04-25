@@ -229,6 +229,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss_lr = (1.0 - opt.lambda_dssim) * Ll1_lr + opt.lambda_dssim * (1.0 - ssim_lr)
         
         # 7. Total Weighted Loss (using your existing scheduling)
+        progress = iteration / opt.iterations
+        curr_lambda_lr = 1.0 * (1.0 - progress) + 0.1 * progress  # From 1.0 down to 0.1
+        curr_lambda_hr = 0.2 * (1.0 - progress) + 1.0 * progress  # From 0.2 up to 1.0
         loss = (curr_lambda_hr * loss_hr) + (curr_lambda_lr * loss_lr)
 
 
