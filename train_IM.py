@@ -315,12 +315,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                # if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                #     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                #     val_9 = 0.02 if iteration > 20000 else 0.005        ###
+                #     gaussians.densify_and_prune(opt.densify_grad_threshold, val_9, scene.cameras_extent, size_threshold, radii)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+            if iteration > opt.densify_from_iter and iteration < 25000:
+                if iteration % opt.densification_interval == 0:
+                    
+                    # Now your logic actually functions at 20k+
+                    prune_threshold = 0.02 if iteration > 20000 else 0.005
+                    
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    
+                    # Call prune_only or use densify_and_prune with a high grad threshold 
+                    # so no NEW points are added, but old ones are still cleaned.
+                    gaussians.densify_and_prune(
+                        opt.densify_grad_threshold if iteration < opt.densify_until_iter else 100.0, 
+                        prune_threshold, 
+                        scene.cameras_extent, 
+                        size_threshold, 
+                        radii
+                    )
 
             # Optimizer step
             if iteration < opt.iterations:
