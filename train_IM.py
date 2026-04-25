@@ -315,30 +315,67 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                # if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                #     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                #     val_9 = 0.02 if iteration > 20000 else 0.005        ###
-                #     gaussians.densify_and_prune(opt.densify_grad_threshold, val_9, scene.cameras_extent, size_threshold, radii)
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    if viewpoint_cam.depth_reliable:
+                        with torch.no_grad():
+                            # Get the current world-space positions of all Gaussians
+                            xyz = gaussians.get_xyz
+                            
+                            # Transform XYZ to Camera Space to get the 'Z' (depth) of each Gaussian
+                            # viewpoint_cam.world_view_transform is [4, 4]
+                            xyz_homo = torch.cat([xyz, torch.ones_like(xyz[:, :1])], dim=-1)
+                            xyz_cam = (xyz_homo @ viewpoint_cam.world_view_transform)
+                            actual_depths = xyz_cam[:, 2] # This is the Z-depth from the camera plane
+                            
+                            # Project Gaussians to 2D screen coordinates to sample the mono-depth map
+                            # viewpoint_cam.full_proj_transform handles the projection
+                            pos_2d = (xyz_homo @ viewpoint_cam.full_proj_transform)
+                            pos_2d = pos_2d[:, :2] / pos_2d[:, 3:4] # Normalize to [-1, 1]
+                            
+                            # Sample the 'Ground Truth' inverse depth from your mono map at these 2D points
+                            # We use grid_sample to get the depth value for every Gaussian's center
+                            grid_coords = pos_2d.unsqueeze(0).unsqueeze(0) # [1, 1, N, 2]
+                            sampled_inv_depth = torch.nn.functional.grid_sample(
+                                viewpoint_cam.invdepthmap.unsqueeze(0), 
+                                grid_coords, 
+                                align_corners=True
+                            ).squeeze() # [N]
+                            
+                            # Convert sampled inverse depth back to linear depth
+                            # (Adding a small epsilon to avoid division by zero)
+                            expected_depths = 1.0 / (sampled_inv_depth + 1e-7)
+                            
+                            # Identify floaters: Gaussians that are significantly CLOSER to the camera 
+                            # than the mono-depth map says they should be.
+                            # 0.1 is a 10% tolerance; adjust based on your scene scale.
+                            depth_error = expected_depths - actual_depths
+                            is_floater = (depth_error > 0.1 * scene.cameras_extent) & visibility_filter
+                            
+                            # Prune them immediately
+                            gaussians.prune_points(is_floater)
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    val_9 = 0.02 if iteration > 20000 else 0.005        ###
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, val_9, scene.cameras_extent, size_threshold, radii)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
-            if iteration > opt.densify_from_iter and iteration < 25000:
-                if iteration % opt.densification_interval == 0:
+            # if iteration > opt.densify_from_iter and iteration < 25000:
+            #     if iteration % opt.densification_interval == 0:
                     
-                    # Now your logic actually functions at 20k+
-                    prune_threshold = 0.02 if iteration > 20000 else 0.005
+            #         # Now your logic actually functions at 20k+
+            #         prune_threshold = 0.02 if iteration > 20000 else 0.005
                     
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+            #         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     
-                    # Call prune_only or use densify_and_prune with a high grad threshold 
-                    # so no NEW points are added, but old ones are still cleaned.
-                    gaussians.densify_and_prune(
-                        opt.densify_grad_threshold if iteration < opt.densify_until_iter else 100.0, 
-                        prune_threshold, 
-                        scene.cameras_extent, 
-                        size_threshold, 
-                        radii
-                    )
+            #         # Call prune_only or use densify_and_prune with a high grad threshold 
+            #         # so no NEW points are added, but old ones are still cleaned.
+            #         gaussians.densify_and_prune(
+            #             opt.densify_grad_threshold if iteration < opt.densify_until_iter else 100.0, 
+            #             prune_threshold, 
+            #             scene.cameras_extent, 
+            #             size_threshold, 
+            #             radii
+            #         )
 
             # Optimizer step
             if iteration < opt.iterations:
