@@ -94,7 +94,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_Ll1depth_for_log = 0.0
 
 
-
     # --- ADD THIS: Initialize S2Gaussian Tracking ---
     flag_grads = {}
     s2_eps = 0.1 # The epsilon decay factor from the paper
@@ -190,10 +189,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # 7. Total Weighted Loss
         # Start with a high weight on LR to fix geometry, then let HR take over for detail
-        lambda_lr = 1.0  
-        lambda_hr = 0.5  # Adjust this: higher means more detail, but more risk of artifacts
-        loss = (lambda_hr * loss_hr) + (lambda_lr * loss_lr)
+        # lambda_lr = 1.0  
+        # lambda_hr = 0.5  # Adjust this: higher means more detail, but more risk of artifacts
+        # loss = (lambda_hr * loss_hr) + (lambda_lr * loss_lr)
 
+
+        progress = iteration / opt.iterations
+        curr_lambda_lr = 1.0 * (1.0 - progress) + 0.1 * progress  # From 1.0 down to 0.1
+        curr_lambda_hr = 0.2 * (1.0 - progress) + 1.0 * progress  # From 0.2 up to 1.0
+        
+        loss = (curr_lambda_hr * loss_hr) + (curr_lambda_lr * loss_lr)
 
 
 
