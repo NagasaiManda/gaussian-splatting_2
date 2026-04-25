@@ -42,7 +42,7 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def prune_near_plane_floaters(gaussians, viewpoint_cam, min_distance=0.2):
+def prune_near_plane_floaters(gaussians, viewpoint_cam, min_distance=0.3):
     """Deletes Gaussians that spawn right in front of the camera lens."""
     xyz = gaussians.get_xyz
     world_view_transform = viewpoint_cam.world_view_transform.cuda()
@@ -52,11 +52,17 @@ def prune_near_plane_floaters(gaussians, viewpoint_cam, min_distance=0.2):
     xyz_view = xyz_homo @ world_view_transform
     z = xyz_view[:, 2] 
     
-    # Find Gaussians that are in front of the camera but TOO close
+    # Identify floaters
     is_too_close = (z > 0.0) & (z < min_distance)
     
     if is_too_close.any():
-        gaussians.prune_points(is_too_close)
+        # IMPORTANT: Use a mask of points to KEEP, which is what 3DGS expects
+        # We want to keep points that are NOT too close
+        keep_mask = ~is_too_close 
+        
+        # We manually update the model parameters instead of calling a 
+        # potentially broken internal prune_points that expects tmp_radii
+        gaussians._densification_postfix(keep_mask)
 
 
 from PIL import Image
