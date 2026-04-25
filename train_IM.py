@@ -42,66 +42,22 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-
-def prune_by_depth(gaussians, viewpoint_cam, threshold=0.1):
-    """
-    Identifies and removes Gaussians that are geometrically inconsistent 
-    with the provided monocular depth map.
-    """
-    if not viewpoint_cam.depth_reliable:
-        return
-
-    # 1. Project Gaussian centers to Camera Space
+def prune_near_plane_floaters(gaussians, viewpoint_cam, min_distance=0.2):
+    """Deletes Gaussians that spawn right in front of the camera lens."""
     xyz = gaussians.get_xyz
     world_view_transform = viewpoint_cam.world_view_transform.cuda()
-    projection_matrix = viewpoint_cam.full_proj_transform.cuda()
     
-    # Transform to view space to get Z (depth)
-    # xyz: [N, 3], world_view: [4, 4]
+    # Transform to view space to get Z-depth
     xyz_homo = torch.cat([xyz, torch.ones_like(xyz[:, :1])], dim=-1)
     xyz_view = xyz_homo @ world_view_transform
-    z = xyz_view[:, 2] # Depth of each Gaussian center
+    z = xyz_view[:, 2] 
     
-    # Avoid division by zero
-    z = torch.clamp(z, min=1e-5)
-    curr_inv_depth = 1.0 / z
+    # Find Gaussians that are in front of the camera but TOO close
+    is_too_close = (z > 0.0) & (z < min_distance)
+    
+    if is_too_close.any():
+        gaussians.prune_points(is_too_close)
 
-    # 2. Project to Image Space (UV coordinates)
-    xyz_ndc = xyz_homo @ projection_matrix
-    xyz_ndc = xyz_ndc[:, :3] / xyz_ndc[:, 3:4]
-    
-    # Convert NDC [-1, 1] to UV [0, 1]
-    u = (xyz_ndc[:, 0] + 1.0) * 0.5
-    v = (xyz_ndc[:, 1] + 1.0) * 0.5
-    
-    # 3. Sample the Monocular Inverse Depth Map
-    # mono_invdepth shape: [1, H, W]
-    mono_invdepth = viewpoint_cam.invdepthmap.cuda()
-    h, w = mono_invdepth.shape[1], mono_invdepth.shape[2]
-    
-    # Filter points outside the frustum
-    mask_in_frustum = (u >= 0) & (u <= 1) & (v >= 0) & (v <= 1) & (xyz_ndc[:, 2] > 0) & (xyz_ndc[:, 2] < 1)
-    
-    # Map UV to pixel coordinates
-    u_px = (u * (w - 1)).long()
-    v_px = (v * (h - 1)).long()
-    
-    # Clamp pixel coordinates to stay within bounds
-    u_px = torch.clamp(u_px, 0, w - 1)
-    v_px = torch.clamp(v_px, 0, h - 1)
-    
-    # Sample GT depth at projected locations
-    sampled_gt_inv_depth = mono_invdepth[0, v_px, u_px]
-    
-    # 4. Compare and Prune
-    # Calculate absolute difference between Gaussian inv_depth and GT inv_depth
-    depth_error = torch.abs(curr_inv_depth - sampled_gt_inv_depth)
-    
-    # A Gaussian is an outlier if it's far from the "surface" defined by the depth map
-    is_outlier = (depth_error > threshold) & mask_in_frustum
-    
-    if is_outlier.any():
-        gaussians.prune_points(is_outlier)
 
 from PIL import Image
 from torchvision import transforms
@@ -336,21 +292,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            if iteration < opt.iterations: # Changed from opt.densify_until_iter to keep pruning active
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-
+            # Densification
+            if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)                    
+                    prune_near_plane_floaters(gaussians, viewpoint_cam, min_distance=0.3)
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    
-                    # A. Standard Densification and Pruning (Based on Gradients and Opacity)
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                    
-                    # B. ADDED: Geometric Pruning (Based on Depth Inconsistency)
-                    # Use a smaller threshold (0.05) later in training for finer cleaning
-                    depth_thresh = 0.1 if iteration < 7000 else 0.05
-                    prune_by_depth(gaussians, viewpoint_cam, threshold=depth_thresh)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
