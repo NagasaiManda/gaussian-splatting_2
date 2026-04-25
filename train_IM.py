@@ -43,45 +43,65 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 
-import torch.nn as nn
-import torch.nn.functional as F
+def prune_by_depth(gaussians, viewpoint_cam, threshold=0.1):
+    """
+    Identifies and removes Gaussians that are geometrically inconsistent 
+    with the provided monocular depth map.
+    """
+    if not viewpoint_cam.depth_reliable:
+        return
 
-class ResBlock(nn.Module):
-    def __init__(self, channels):
-        super(ResBlock, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        )
-    def forward(self, x): return x + self.conv(x)
+    # 1. Project Gaussian centers to Camera Space
+    xyz = gaussians.get_xyz
+    world_view_transform = viewpoint_cam.world_view_transform.cuda()
+    projection_matrix = viewpoint_cam.full_proj_transform.cuda()
+    
+    # Transform to view space to get Z (depth)
+    # xyz: [N, 3], world_view: [4, 4]
+    xyz_homo = torch.cat([xyz, torch.ones_like(xyz[:, :1])], dim=-1)
+    xyz_view = xyz_homo @ world_view_transform
+    z = xyz_view[:, 2] # Depth of each Gaussian center
+    
+    # Avoid division by zero
+    z = torch.clamp(z, min=1e-5)
+    curr_inv_depth = 1.0 / z
 
-class InconsistencyModule(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(ResBlock(3), ResBlock(3))
-    def forward(self, x): return x + self.net(x)
-
-class BlurProposalModule(nn.Module):
-    def __init__(self, kernel_size=5):
-        super().__init__()
-        self.k = kernel_size
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 16, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(32, kernel_size**2, 3, padding=1),
-            nn.Softmax(dim=1)
-        )
-    def forward(self, x): return self.net(x)
-
-def apply_blur_per_pixel(img, kernels, k=5):
-    b, c, h, w = img.shape
-    pad = k // 2
-    img_padded = F.pad(img, (pad, pad, pad, pad))
-    patches = img_padded.unfold(2, k, 1).unfold(3, k, 1) # [B, C, H, W, K, K]
-    patches = patches.contiguous().view(b, c, h, w, -1) 
-    kernels = kernels.unsqueeze(1) # [B, 1, K*K, H, W]
-    return (patches * kernels.permute(0, 1, 3, 4, 2)).sum(-1)
+    # 2. Project to Image Space (UV coordinates)
+    xyz_ndc = xyz_homo @ projection_matrix
+    xyz_ndc = xyz_ndc[:, :3] / xyz_ndc[:, 3:4]
+    
+    # Convert NDC [-1, 1] to UV [0, 1]
+    u = (xyz_ndc[:, 0] + 1.0) * 0.5
+    v = (xyz_ndc[:, 1] + 1.0) * 0.5
+    
+    # 3. Sample the Monocular Inverse Depth Map
+    # mono_invdepth shape: [1, H, W]
+    mono_invdepth = viewpoint_cam.invdepthmap.cuda()
+    h, w = mono_invdepth.shape[1], mono_invdepth.shape[2]
+    
+    # Filter points outside the frustum
+    mask_in_frustum = (u >= 0) & (u <= 1) & (v >= 0) & (v <= 1) & (xyz_ndc[:, 2] > 0) & (xyz_ndc[:, 2] < 1)
+    
+    # Map UV to pixel coordinates
+    u_px = (u * (w - 1)).long()
+    v_px = (v * (h - 1)).long()
+    
+    # Clamp pixel coordinates to stay within bounds
+    u_px = torch.clamp(u_px, 0, w - 1)
+    v_px = torch.clamp(v_px, 0, h - 1)
+    
+    # Sample GT depth at projected locations
+    sampled_gt_inv_depth = mono_invdepth[0, v_px, u_px]
+    
+    # 4. Compare and Prune
+    # Calculate absolute difference between Gaussian inv_depth and GT inv_depth
+    depth_error = torch.abs(curr_inv_depth - sampled_gt_inv_depth)
+    
+    # A Gaussian is an outlier if it's far from the "surface" defined by the depth map
+    is_outlier = (depth_error > threshold) & mask_in_frustum
+    
+    if is_outlier.any():
+        gaussians.prune_points(is_outlier)
 
 from PIL import Image
 from torchvision import transforms
@@ -115,17 +135,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # Around line 40 in train.py, after "scene = Scene(...)"
     print(f"DEBUG: Camera 0 resolution is {scene.getTrainCameras()[0].image_width}x{scene.getTrainCameras()[0].image_height}")
     gaussians.training_setup(opt)
-
-  #############################################
-    im_module = InconsistencyModule().to("cuda")
-    bp_module = BlurProposalModule(kernel_size=5).to("cuda")
-    # Small LR for these modules so they don't overfit to a single view too fast
-    extra_optimizer = torch.optim.Adam(
-        list(im_module.parameters()) + list(bp_module.parameters()), 
-        lr=1e-4
-    )
-
-  ############################################
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -147,7 +156,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     # --- ADD THIS: Initialize S2Gaussian Tracking ---
     flag_grads = {}
-    s2_eps = 0.01 # The epsilon decay factor from the paper, changed from 0.1
+    s2_eps = 0.1 # The epsilon decay factor from the paper
     
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -211,33 +220,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         ######################################################################################################
         
-        # 1. Prepare Ground Truths
         gt_image_hr = viewpoint_cam.original_image.cuda()
+        
+        # 2. Get the actual LR ground truth (the original un-processed images)
         gt_image_lr = load_lr_gt(viewpoint_cam, dataset.source_path)
         
-        # 2. Render and Process for Loss
+        # 3. Render at HR (this is what the 'render' function already does)
         image_hr = render_pkg["render"]
         
-        # --- INCONSISTENCY MODELING (Ghost-Busting) ---
-        # Modify the SR target to account for hallucinations (Inconsistency Module)
-        # We use unsqueeze/squeeze because modules expect [B, C, H, W]
-        gt_image_hr_modified = im_module(gt_image_hr.unsqueeze(0)).squeeze(0)
-        
-        # Predict per-pixel blur for the rendering (Blur Proposal Module)
-        # We detach image_hr so the BP module only learns to describe the current state
-        blur_kernels = bp_module(image_hr.detach().unsqueeze(0))
-        image_hr_blurred = apply_blur_per_pixel(image_hr.unsqueeze(0), blur_kernels).squeeze(0)
-        
-        # 3. Compute HR Loss (Render_Blurred vs Modified_SR_Target)
-        Ll1_hr = l1_loss(image_hr_blurred, gt_image_hr_modified)
-        if FUSED_SSIM_AVAILABLE:
-            ssim_hr = fused_ssim(image_hr_blurred.unsqueeze(0), gt_image_hr_modified.unsqueeze(0))
-        else:
-            ssim_hr = ssim(image_hr_blurred, gt_image_hr_modified)
-        loss_hr = (1.0 - opt.lambda_dssim) * Ll1_hr + opt.lambda_dssim * (1.0 - ssim_hr)
-
-        # 4. Compute LR Loss (The "Anchor" Loss vs. original LR images)
-        # We downsample the SHARP rendering, not the blurred one
+        # 4. Downsample the rendered HR image to match LR resolution
+        # We use area interpolation as it's standard for downsampling
         lr_height, lr_width = gt_image_lr.shape[1], gt_image_lr.shape[2]
         image_lr_rendered = torch.nn.functional.interpolate(
             image_hr.unsqueeze(0), 
@@ -245,19 +237,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             mode='area'
         ).squeeze(0)
 
+        # 5. Compute HR Loss (vs. Super-resolved images)
+        Ll1_hr = l1_loss(image_hr, gt_image_hr)
+        ssim_hr = fused_ssim(image_hr.unsqueeze(0), gt_image_hr.unsqueeze(0)) if FUSED_SSIM_AVAILABLE else ssim(image_hr, gt_image_hr)
+        loss_hr = (1.0 - opt.lambda_dssim) * Ll1_hr + opt.lambda_dssim * (1.0 - ssim_hr)
+
+        # 6. Compute LR Loss (The "Anchor" Loss vs. original LR images)
         Ll1_lr = l1_loss(image_lr_rendered, gt_image_lr)
-        if FUSED_SSIM_AVAILABLE:
-            ssim_lr = fused_ssim(image_lr_rendered.unsqueeze(0), gt_image_lr.unsqueeze(0))
-        else:
-            ssim_lr = ssim(image_lr_rendered, gt_image_lr)
+        ssim_lr = fused_ssim(image_lr_rendered.unsqueeze(0), gt_image_lr.unsqueeze(0)) if FUSED_SSIM_AVAILABLE else ssim(image_lr_rendered, gt_image_lr)
         loss_lr = (1.0 - opt.lambda_dssim) * Ll1_lr + opt.lambda_dssim * (1.0 - ssim_lr)
 
-        # 5. Total Weighted Loss with Dynamic Ramping
+        # 7. Total Weighted Loss
+        # Start with a high weight on LR to fix geometry, then let HR take over for detail
+        # lambda_lr = 1.0  
+        # lambda_hr = 0.5  # Adjust this: higher means more detail, but more risk of artifacts
+        # loss = (lambda_hr * loss_hr) + (lambda_lr * loss_lr)
+
+
         progress = iteration / opt.iterations
-        curr_lambda_lr = 1.0 * (1.0 - progress) + 0.1 * progress  # Anchor geometry first
-        curr_lambda_hr = 0.2 * (1.0 - progress) + 1.0 * progress  # Detail later
+        curr_lambda_lr = 1.0 * (1.0 - progress) + 0.1 * progress  # From 1.0 down to 0.1
+        curr_lambda_hr = 0.2 * (1.0 - progress) + 1.0 * progress  # From 0.2 up to 1.0
         
         loss = (curr_lambda_hr * loss_hr) + (curr_lambda_lr * loss_lr)
+
 
 
         ######################################################################################################
@@ -334,15 +336,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # Densification
-            if iteration < opt.densify_until_iter:
+            if iteration < opt.iterations: # Changed from opt.densify_until_iter to keep pruning active
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    
+                    # A. Standard Densification and Pruning (Based on Gradients and Opacity)
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    
+                    # B. ADDED: Geometric Pruning (Based on Depth Inconsistency)
+                    # Use a smaller threshold (0.05) later in training for finer cleaning
+                    depth_thresh = 0.1 if iteration < 7000 else 0.05
+                    prune_by_depth(gaussians, viewpoint_cam, threshold=depth_thresh)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -358,9 +366,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
-
-            extra_optimizer.step()
-            extra_optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
