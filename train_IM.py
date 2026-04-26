@@ -537,6 +537,9 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 
+
+
+
 def get_perturbed_cam(viewpoint_cam, translation_std=0.002, rotation_std=0.001):
     """
     Slightly jiggles the camera extrinsics to prevent billboard overfitting.
@@ -654,94 +657,170 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        if iteration > opt.densify_until_iter:
-            render_cam = get_perturbed_cam(viewpoint_cam, translation_std=0.001) 
-        else:
-            render_cam = viewpoint_cam
 
-# Render with the jiggled camera
-        render_pkg = render(render_cam, gaussians, pipe, bg, 
-                    use_trained_exp=dataset.train_test_exp, 
-                    separate_sh=SPARSE_ADAM_AVAILABLE)
-        # render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        # --- 1. Dual Rendering Pass ---
+        # A. Standard render at the Ground Truth camera position
+        render_pkg_std = render(viewpoint_cam, gaussians, pipe, bg, 
+                                use_trained_exp=dataset.train_test_exp, 
+                                separate_sh=SPARSE_ADAM_AVAILABLE)
+        image_hr = render_pkg_std["render"]
+        
+        # We use the standard pass for densification stats
+        viewspace_point_tensor = render_pkg_std["viewspace_points"]
+        visibility_filter = render_pkg_std["visibility_filter"]
+        radii = render_pkg_std["radii"]
 
+        # B. Perturbed render for consistency (starts after geometry settles at 5k)
+        image_pert = None
+        if iteration > 5000:
+            pert_cam = get_perturbed_cam(viewpoint_cam, translation_std=0.002, rotation_std=0.001)
+            render_pkg_pert = render(pert_cam, gaussians, pipe, bg, 
+                                    use_trained_exp=dataset.train_test_exp, 
+                                    separate_sh=SPARSE_ADAM_AVAILABLE)
+            image_pert = render_pkg_pert["render"]
+
+        # Apply alpha masks if present
         if viewpoint_cam.alpha_mask is not None:
-            alpha_mask = viewpoint_cam.alpha_mask.cuda()
-            image *= alpha_mask
+            mask = viewpoint_cam.alpha_mask.cuda()
+            image_hr *= mask
+            if image_pert is not None:
+                image_pert *= mask
 
-        # Loss
-        # gt_image = viewpoint_cam.original_image.cuda()
-        # Ll1 = l1_loss(image, gt_image)
-        # if FUSED_SSIM_AVAILABLE:
-        #     ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
-        # else:
-        #     ssim_value = ssim(image, gt_image)
-
-        # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-
-
-
-
-        ######################################################################################################
-        
+        # --- 2. HR Sharpness Loss (Standard View) ---
         gt_image_hr = viewpoint_cam.original_image.cuda()
-        
-        # 2. Get the actual LR ground truth (the original un-processed images)
-        gt_image_lr = load_lr_gt(viewpoint_cam, dataset.source_path)
-        
-        # 3. Render at HR (this is what the 'render' function already does)
-        image_hr = render_pkg["render"]
-        
-        # 4. Downsample the rendered HR image to match LR resolution
-        # We use area interpolation as it's standard for downsampling
-        lr_height, lr_width = gt_image_lr.shape[1], gt_image_lr.shape[2]
-        image_lr_rendered = torch.nn.functional.interpolate(
-            image_hr.unsqueeze(0), 
-            size=(lr_height, lr_width), 
-            mode='area'
-        ).squeeze(0)
-
-        # 5. Compute HR Loss (vs. Super-resolved images)
         Ll1_hr = l1_loss(image_hr, gt_image_hr)
-        # Use fused_ssim if available for speed, otherwise standard ssim
-        if FUSED_SSIM_AVAILABLE:
-            ssim_hr = fused_ssim(image_hr.unsqueeze(0), gt_image_hr.unsqueeze(0))
-        else:
-            ssim_hr = ssim(image_hr, gt_image_hr)
+        ssim_hr = fused_ssim(image_hr.unsqueeze(0), gt_image_hr.unsqueeze(0)) if FUSED_SSIM_AVAILABLE else ssim(image_hr, gt_image_hr)
         
-        # Standard 3DGS formula: (1-lambda)*L1 + lambda*(1-SSIM)
-        loss_hr = (1.0 - opt.lambda_dssim) * Ll1_hr + opt.lambda_dssim * (1.0 - ssim_hr)
+        # Edge-aware Laplacian for high-frequency detail
+        lap_k = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32, device="cuda").view(1, 1, 3, 3).repeat(3, 1, 1, 1)
+        loss_lap = torch.nn.functional.l1_loss(
+            torch.nn.functional.conv2d(image_hr.unsqueeze(0), lap_k, groups=3, padding=1),
+            torch.nn.functional.conv2d(gt_image_hr.unsqueeze(0), lap_k, groups=3, padding=1)
+        )
+        loss_hr = (1.0 - opt.lambda_dssim) * Ll1_hr + opt.lambda_dssim * (1.0 - ssim_hr) + 0.05 * loss_lap
+
+        # --- 3. LR Anchor Loss (Standard View) ---
+        gt_image_lr = load_lr_gt(viewpoint_cam, dataset.source_path)
+        l_h, l_w = gt_image_lr.shape[1], gt_image_lr.shape[2]
+        image_lr_rendered = torch.nn.functional.interpolate(image_hr.unsqueeze(0), size=(l_h, l_w), mode='area').squeeze(0)
         
-        # 6. Compute LR Loss (Anchor Loss)
         Ll1_lr = l1_loss(image_lr_rendered, gt_image_lr)
-        if FUSED_SSIM_AVAILABLE:
-            ssim_lr = fused_ssim(image_lr_rendered.unsqueeze(0), gt_image_lr.unsqueeze(0))
-        else:
-            ssim_lr = ssim(image_lr_rendered, gt_image_lr)
-        
+        ssim_lr = fused_ssim(image_lr_rendered.unsqueeze(0), gt_image_lr.unsqueeze(0)) if FUSED_SSIM_AVAILABLE else ssim(image_lr_rendered, gt_image_lr)
         loss_lr = (1.0 - opt.lambda_dssim) * Ll1_lr + opt.lambda_dssim * (1.0 - ssim_lr)
 
+        # --- 4. Regularization (Consistency & Anisotropy) ---
+        loss_consistency = 0.0
+        if image_pert is not None:
+            # Force standard and perturbed views to be similar (the "Anti-Billboard" rule)
+            loss_consistency = l1_loss(image_hr, image_pert)
 
-        if iteration <= 10000:
-            # Phase 1: Geometry Building (Pure LR)
-            curr_lambda_lr = 1.0
-            curr_lambda_hr = 0.0 
+        # Anisotropy penalty: prevents Gaussians from becoming infinitely flat
+        scales = gaussians.get_scaling
+        ratio = torch.max(scales, dim=1).values / (torch.min(scales, dim=1).values + 1e-7)
+        loss_aniso = torch.where(ratio > 10.0, ratio, torch.zeros_like(ratio)).mean()
+
+        # --- 5. Total Loss with Multi-Phase Scheduling ---
+        if iteration <= 7000:
+            # Phase 1: Pure geometry and LR alignment
+            curr_lambda_lr, curr_lambda_hr, curr_lambda_cons = 1.0, 0.1, 0.0
         else:
-            # Phase 2: Texture/Detail Fine-Tuning (Mix HR and LR)
-            # Calculate progress purely for the post-densification phase
-            fine_tune_progress = (iteration - opt.densify_until_iter) / (opt.iterations - opt.densify_until_iter)
-            
-            # Keep a small LR anchor, but ramp up HR to add details
-            curr_lambda_lr = 0.5 * (1.0 - fine_tune_progress) + 0.1 * fine_tune_progress
-            curr_lambda_hr = 0.5 * fine_tune_progress + 1.0 * fine_tune_progress 
+            # Phase 2: Detail sharpening and spatial consistency
+            prog = min(1.0, (iteration - 7000) / (opt.iterations - 7000))
+            curr_lambda_lr = 0.5 * (1.0 - prog) + 0.1
+            curr_lambda_hr = 0.5 + (0.5 * prog)
+            curr_lambda_cons = 0.2 * prog 
 
-        loss = (curr_lambda_hr * loss_hr) + (curr_lambda_lr * loss_lr)
-        # # 7. Total Weighted Loss (using your existing scheduling)
-        # progress = iteration / opt.iterations
-        # curr_lambda_lr = 1.0 * (1.0 - progress) + 0.1 * progress  # From 1.0 down to 0.1
-        # curr_lambda_hr = 0.2 * (1.0 - progress) + 1.0 * progress  # From 0.2 up to 1.0
-        # loss = (curr_lambda_hr * loss_hr) + (curr_lambda_lr * loss_lr)
+        loss = (curr_lambda_hr * loss_hr) + (curr_lambda_lr * loss_lr) + \
+               (curr_lambda_cons * loss_consistency) + (0.01 * loss_aniso)
+
+#         if iteration > opt.densify_until_iter:
+#             render_cam = get_perturbed_cam(viewpoint_cam, translation_std=0.001) 
+#         else:
+#             render_cam = viewpoint_cam
+
+# # Render with the jiggled camera
+#         render_pkg = render(render_cam, gaussians, pipe, bg, 
+#                     use_trained_exp=dataset.train_test_exp, 
+#                     separate_sh=SPARSE_ADAM_AVAILABLE)
+#         # render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+#         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
+#         if viewpoint_cam.alpha_mask is not None:
+#             alpha_mask = viewpoint_cam.alpha_mask.cuda()
+#             image *= alpha_mask
+
+#         # Loss
+#         # gt_image = viewpoint_cam.original_image.cuda()
+#         # Ll1 = l1_loss(image, gt_image)
+#         # if FUSED_SSIM_AVAILABLE:
+#         #     ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+#         # else:
+#         #     ssim_value = ssim(image, gt_image)
+
+#         # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+
+
+
+#         ######################################################################################################
+        
+#         gt_image_hr = viewpoint_cam.original_image.cuda()
+        
+#         # 2. Get the actual LR ground truth (the original un-processed images)
+#         gt_image_lr = load_lr_gt(viewpoint_cam, dataset.source_path)
+        
+#         # 3. Render at HR (this is what the 'render' function already does)
+#         image_hr = render_pkg["render"]
+        
+#         # 4. Downsample the rendered HR image to match LR resolution
+#         # We use area interpolation as it's standard for downsampling
+#         lr_height, lr_width = gt_image_lr.shape[1], gt_image_lr.shape[2]
+#         image_lr_rendered = torch.nn.functional.interpolate(
+#             image_hr.unsqueeze(0), 
+#             size=(lr_height, lr_width), 
+#             mode='area'
+#         ).squeeze(0)
+
+#         # 5. Compute HR Loss (vs. Super-resolved images)
+#         Ll1_hr = l1_loss(image_hr, gt_image_hr)
+#         # Use fused_ssim if available for speed, otherwise standard ssim
+#         if FUSED_SSIM_AVAILABLE:
+#             ssim_hr = fused_ssim(image_hr.unsqueeze(0), gt_image_hr.unsqueeze(0))
+#         else:
+#             ssim_hr = ssim(image_hr, gt_image_hr)
+        
+#         # Standard 3DGS formula: (1-lambda)*L1 + lambda*(1-SSIM)
+#         loss_hr = (1.0 - opt.lambda_dssim) * Ll1_hr + opt.lambda_dssim * (1.0 - ssim_hr)
+        
+#         # 6. Compute LR Loss (Anchor Loss)
+#         Ll1_lr = l1_loss(image_lr_rendered, gt_image_lr)
+#         if FUSED_SSIM_AVAILABLE:
+#             ssim_lr = fused_ssim(image_lr_rendered.unsqueeze(0), gt_image_lr.unsqueeze(0))
+#         else:
+#             ssim_lr = ssim(image_lr_rendered, gt_image_lr)
+        
+#         loss_lr = (1.0 - opt.lambda_dssim) * Ll1_lr + opt.lambda_dssim * (1.0 - ssim_lr)
+
+
+#         if iteration <= 10000:
+#             # Phase 1: Geometry Building (Pure LR)
+#             curr_lambda_lr = 1.0
+#             curr_lambda_hr = 0.0 
+#         else:
+#             # Phase 2: Texture/Detail Fine-Tuning (Mix HR and LR)
+#             # Calculate progress purely for the post-densification phase
+#             fine_tune_progress = (iteration - opt.densify_until_iter) / (opt.iterations - opt.densify_until_iter)
+            
+#             # Keep a small LR anchor, but ramp up HR to add details
+#             curr_lambda_lr = 0.5 * (1.0 - fine_tune_progress) + 0.1 * fine_tune_progress
+#             curr_lambda_hr = 0.5 * fine_tune_progress + 1.0 * fine_tune_progress 
+
+#         loss = (curr_lambda_hr * loss_hr) + (curr_lambda_lr * loss_lr)
+#         # # 7. Total Weighted Loss (using your existing scheduling)
+#         # progress = iteration / opt.iterations
+#         # curr_lambda_lr = 1.0 * (1.0 - progress) + 0.1 * progress  # From 1.0 down to 0.1
+#         # curr_lambda_hr = 0.2 * (1.0 - progress) + 1.0 * progress  # From 0.2 up to 1.0
+#         # loss = (curr_lambda_hr * loss_hr) + (curr_lambda_lr * loss_lr)
 
 
         ######################################################################################################
